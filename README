@@ -1,0 +1,2 @@
+Usage:
+go run inlined.go path/to/binary | c++filt
