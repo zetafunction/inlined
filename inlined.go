@@ -130,18 +130,19 @@ func sortAndPrintTop100(results map[string]*costInfo) {
 		keys = append(keys, k)
 	}
 	sort.Sort(&resultSorter{keys, results})
+	fmt.Printf("     Count      Bytes   Name\n")
+	fmt.Printf("  --------  ---------   ---------------------------------\n")
 	for i, k := range keys {
 		if i > 100 {
 			break
 		}
-		log.Printf("Function %s was inlined %d times and used %d bytes",
-			k, results[k].count, results[k].bytes)
+		fmt.Printf("%10d %10d   %s\n", results[k].count, results[k].bytes, k)
 	}
 }
 
 func main() {
 	for _, f := range os.Args[1:] {
-		log.Printf("Analyzing %s...\n", f)
+		log.Printf("analyzing %s...", f)
 		elf, err := elf.Open(f)
 		if err != nil {
 			log.Printf("error: couldn't open %s: %v", f, err)
