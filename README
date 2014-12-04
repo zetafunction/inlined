@@ -1,2 +1,2 @@
 Usage:
-go run inlined.go path/to/binary | c++filt
+go run inlined.go path/to/binary 2>&1 | c++filt
