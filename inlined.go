@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"os"
 	"sort"
 )
@@ -71,10 +72,16 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 		switch file.Class {
 		case elf.ELFCLASS32:
 			begin = uint64(byteOrder.Uint32(buffer))
-			end = uint64(byteOrder.Uint64(buffer[4:]))
+			end = uint64(byteOrder.Uint32(buffer[4:]))
+			if begin == math.MaxUint32 {
+				continue
+			}
 		case elf.ELFCLASS64:
 			begin = byteOrder.Uint64(buffer)
 			end = byteOrder.Uint64(buffer[8:])
+			if begin == math.MaxUint64 {
+				continue
+			}
 		}
 		if begin == 0 && end == 0 {
 			currentOffset = pendingOffset
