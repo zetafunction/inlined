@@ -12,11 +12,6 @@ import (
 
 const attrMIPSLinkageName dwarf.Attr = 0x2007
 
-type costInfo struct {
-	count uint64 // Number of times the function was inlined.
-	bytes uint64 // Total bytes inlined for the function.
-}
-
 type subprogramMap map[dwarf.Offset]*dwarf.Entry
 
 // Attempts to extract a function name from the DIE at the provided offset. Unfortunately, since
@@ -46,9 +41,21 @@ func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error
 	return "", fmt.Errorf("%v missing name, linkage name, and spec", subprogram)
 }
 
-func analyze(data *dwarf.Data) (map[string]*costInfo, error) {
+type inlineStats struct {
+	count uint64 // Number of times the function was inlined.
+	bytes uint64 // Total bytes inlined for the function.
+}
+
+func analyze(elf *elf.File) (map[string]*inlineStats, error) {
+	// Strictly speaking, dwarf.Data should have other debug sections too, but in practice,
+	// only .debug_info is exposed.
+	debugInfo, err := elf.DWARF()
+	if err != nil {
+		return nil, err
+	}
+
 	// DIEs may refer to a DIE with a greater offset, so collect all interesting DIEs first.
-	reader := data.Reader()
+	reader := debugInfo.Reader()
 	subprograms := make(subprogramMap)
 	inlinedSubroutines := make([]*dwarf.Entry, 0, 1024)
 	for i := 0; ; i++ {
@@ -71,7 +78,7 @@ func analyze(data *dwarf.Data) (map[string]*costInfo, error) {
 	}
 
 	log.Printf("got %d inlined subroutines", len(inlinedSubroutines))
-	results := make(map[string]*costInfo)
+	results := make(map[string]*inlineStats)
 	for _, entry := range inlinedSubroutines {
 		subprogramOffset, ok := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
 		if !ok {
@@ -97,7 +104,7 @@ func analyze(data *dwarf.Data) (map[string]*costInfo, error) {
 
 		info, ok := results[name]
 		if !ok {
-			info = &costInfo{}
+			info = &inlineStats{}
 			results[name] = info
 		}
 		info.count++
@@ -109,7 +116,7 @@ func analyze(data *dwarf.Data) (map[string]*costInfo, error) {
 type resultSorter struct {
 	// TOOO(dcheng): Bad names are bad.
 	keys    []string
-	results map[string]*costInfo
+	results map[string]*inlineStats
 }
 
 func (s *resultSorter) Len() int {
@@ -124,7 +131,7 @@ func (s *resultSorter) Less(i, j int) bool {
 	return s.results[s.keys[i]].bytes > s.results[s.keys[j]].bytes
 }
 
-func sortAndPrintTop100(results map[string]*costInfo) {
+func sortAndPrintTop100(results map[string]*inlineStats) {
 	keys := make([]string, 0, len(results))
 	for k := range results {
 		keys = append(keys, k)
@@ -148,12 +155,7 @@ func main() {
 			log.Printf("error: couldn't open %s: %v", f, err)
 			continue
 		}
-		debugData, err := elf.DWARF()
-		if err != nil {
-			log.Printf("error: couldn't load debug data for %s: %v", f, err)
-			continue
-		}
-		results, err := analyze(debugData)
+		results, err := analyze(elf)
 		if err != nil {
 			log.Printf("error: couldn't analyze debug data for %s: %v", f, err)
 			continue
