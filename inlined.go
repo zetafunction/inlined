@@ -95,7 +95,13 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 	}
 }
 
-type subprogramMap map[dwarf.Offset]*dwarf.Entry
+type subprogramEntry struct {
+	name string
+	linkageName string
+	hasSpecOffset bool
+	specOffset dwarf.Offset
+}
+type subprogramMap map[dwarf.Offset]*subprogramEntry
 
 // Attempts to extract a function name from the DIE at the provided offset. Unfortunately, since
 // it's C++ and DWARF, it's not just a simple matter of getting name attribute and returning it.
@@ -105,23 +111,19 @@ func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error
 		return "", errors.New("couldn't find subprogram")
 	}
 
-	// TODO(dcheng): Ideally, demangle this name.
-	if name, ok := subprogram.Val(attrMIPSLinkageName).(string); ok {
-		return name, nil
+	if subprogram.linkageName != "" {
+		return subprogram.linkageName, nil
 	}
 
-	// Some DIEs chain to another DIE with DW_AT_specification.
-	// TODO(dcheng): Document when this happens.
-	if specOffset, ok := subprogram.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
-		return nameForEntry(subprograms, specOffset)
+	if subprogram.hasSpecOffset {
+		return nameForEntry(subprograms, subprogram.specOffset)
 	}
 
-	// Otherwise, fall back to DW_AT_name. This is probably a plain C function.
-	if name, ok := subprogram.Val(dwarf.AttrName).(string); ok {
-		return name, nil
+	if subprogram.name != "" {
+		return subprogram.name, nil
 	}
 
-	return "", fmt.Errorf("%v missing name, linkage name, and spec", subprogram)
+	return "", fmt.Errorf("subprogram 0x%x has no name, linkage name, or spec", offset)
 }
 
 func bytesForEntry(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) {
@@ -188,9 +190,18 @@ func analyze(file *elf.File) (map[string]*inlineStats, error) {
 		}
 		switch entry.Tag {
 		case dwarf.TagSubprogram:
-			// TODO(dcheng): Consider storing a reduced set of information, since
-			// there are a lot of subprogram DIEs in Chrome.
-			subprograms[entry.Offset] = entry
+			subprogram := &subprogramEntry{}
+			if name, ok := entry.Val(attrMIPSLinkageName).(string); ok {
+				subprogram.linkageName = name
+			}
+			if specOffset, ok := entry.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
+				subprogram.hasSpecOffset = true
+				subprogram.specOffset = specOffset
+			}
+			if name, ok := entry.Val(dwarf.AttrName).(string); ok {
+				subprogram.name = name
+			}
+			subprograms[entry.Offset] = subprogram
 		case dwarf.TagInlinedSubroutine:
 			inlinedSubroutines = append(inlinedSubroutines, entry)
 		}
