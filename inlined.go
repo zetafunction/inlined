@@ -15,7 +15,7 @@ import (
 
 const attrMIPSLinkageName dwarf.Attr = 0x2007
 
-type rangeSizeMap map[dwarf.Offset]uint64
+type rangeSizeMap map[int64]uint64
 
 // Go's debug/dwarf package doesn't include .debug_ranges parsing support.
 func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
@@ -55,7 +55,7 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 	//   address of subsequent entries.
 	// - An end of list entry is a range list entry that has a beginning and ending address
 	//   offset of 0.
-	var currentOffset, pendingOffset dwarf.Offset
+	var currentOffset, pendingOffset int64
 	rangeSizes := make(rangeSizeMap)
 	buffer := make([]byte, 2*bytesPerAddress)
 	for {
@@ -67,7 +67,7 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 		} else if err != nil {
 			return nil, err
 		}
-		pendingOffset += dwarf.Offset(n)
+		pendingOffset += int64(n)
 		var begin, end uint64
 		switch file.Class {
 		case elf.ELFCLASS32:
@@ -96,16 +96,31 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 }
 
 type subprogramEntry struct {
-	name string
-	linkageName string
+	name          string
+	linkageName   string
 	hasSpecOffset bool
-	specOffset dwarf.Offset
+	specOffset    dwarf.Offset
 }
 type subprogramMap map[dwarf.Offset]*subprogramEntry
 
+func newSubprogramEntry(entry *dwarf.Entry) *subprogramEntry {
+	subprogram := &subprogramEntry{}
+	if linkageName, ok := entry.Val(attrMIPSLinkageName).(string); ok {
+		subprogram.linkageName = linkageName
+	}
+	if specOffset, ok := entry.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
+		subprogram.hasSpecOffset = true
+		subprogram.specOffset = specOffset
+	}
+	if name, ok := entry.Val(dwarf.AttrName).(string); ok {
+		subprogram.name = name
+	}
+	return subprogram
+}
+
 // Attempts to extract a function name from the DIE at the provided offset. Unfortunately, since
 // it's C++ and DWARF, it's not just a simple matter of getting name attribute and returning it.
-func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error) {
+func nameForSubprogram(subprograms subprogramMap, offset dwarf.Offset) (string, error) {
 	subprogram, ok := subprograms[offset]
 	if !ok {
 		return "", errors.New("couldn't find subprogram")
@@ -116,7 +131,7 @@ func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error
 	}
 
 	if subprogram.hasSpecOffset {
-		return nameForEntry(subprograms, subprogram.specOffset)
+		return nameForSubprogram(subprograms, subprogram.specOffset)
 	}
 
 	if subprogram.name != "" {
@@ -126,7 +141,7 @@ func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error
 	return "", fmt.Errorf("subprogram 0x%x has no name, linkage name, or spec", offset)
 }
 
-func bytesForEntry(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) {
+func bytesForInlinedSubroutine(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) {
 	// Per the DWARF spec, a DIE with associated machine code may have:
 	// - A DW_AT_low_pc attribute for a snigle address (not handled)
 	// - A DW_AT_low_pc and DW_AT_high_pc attribute for a single contiguous range of
@@ -144,7 +159,7 @@ func bytesForEntry(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) 
 		return uint64(bytes), nil
 	}
 
-	rangeOffset, ok := entry.Val(dwarf.AttrRanges).(dwarf.Offset)
+	rangeOffset, ok := entry.Val(dwarf.AttrRanges).(int64)
 	if !ok {
 		return 0, fmt.Errorf("%v has no valid high pc or range", entry)
 	}
@@ -155,12 +170,12 @@ func bytesForEntry(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) 
 	return bytes, nil
 }
 
-type inlineStats struct {
+type stats struct {
 	count uint64 // Number of times the function was inlined.
 	bytes uint64 // Total bytes inlined for the function.
 }
 
-func analyze(file *elf.File) (map[string]*inlineStats, error) {
+func analyze(file *elf.File) (map[string]*stats, error) {
 	rangeSizes, err := parseDebugRangesFromELF(file)
 	if err != nil {
 		return nil, err
@@ -173,10 +188,11 @@ func analyze(file *elf.File) (map[string]*inlineStats, error) {
 		return nil, err
 	}
 
-	// DIEs may refer to a DIE with a greater offset, so collect all interesting DIEs first.
+	// DIEs may refer to a DIE with a greater offset, so defer name resolution until all DIEs
+	// have been read.
 	infoReader := debugInfo.Reader()
 	subprograms := make(subprogramMap)
-	inlinedSubroutines := make([]*dwarf.Entry, 0, 1024)
+	rawStats := make(map[dwarf.Offset]*stats)
 	for i := 0; ; i++ {
 		if i%1000000 == 0 {
 			log.Printf("read %d DIEs...", i)
@@ -190,80 +206,77 @@ func analyze(file *elf.File) (map[string]*inlineStats, error) {
 		}
 		switch entry.Tag {
 		case dwarf.TagSubprogram:
-			subprogram := &subprogramEntry{}
-			if name, ok := entry.Val(attrMIPSLinkageName).(string); ok {
-				subprogram.linkageName = name
-			}
-			if specOffset, ok := entry.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
-				subprogram.hasSpecOffset = true
-				subprogram.specOffset = specOffset
-			}
-			if name, ok := entry.Val(dwarf.AttrName).(string); ok {
-				subprogram.name = name
-			}
-			subprograms[entry.Offset] = subprogram
+			subprograms[entry.Offset] = newSubprogramEntry(entry)
 		case dwarf.TagInlinedSubroutine:
-			inlinedSubroutines = append(inlinedSubroutines, entry)
+			abstractOrigin, ok := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
+			if !ok {
+				log.Printf("error: %v missing abstract origin", entry)
+				continue
+			}
+			bytes, err := bytesForInlinedSubroutine(rangeSizes, entry)
+			if err != nil {
+				log.Printf("error: %v", err)
+				continue
+			}
+			s, ok := rawStats[abstractOrigin]
+			if !ok {
+				s = &stats{}
+				rawStats[abstractOrigin] = s
+			}
+			s.count++
+			s.bytes += bytes
 		}
 	}
 
-	log.Printf("got %d inlined subroutines", len(inlinedSubroutines))
-	results := make(map[string]*inlineStats)
-	for _, entry := range inlinedSubroutines {
-		subprogramOffset, ok := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
-		if !ok {
-			log.Printf("error: %v missing abstract origin", entry)
-			continue
-		}
-		name, err := nameForEntry(subprograms, subprogramOffset)
+	log.Printf("resolving names for %d inlined functions", len(rawStats))
+	results := make(map[string]*stats)
+	for abstractOrigin, rawStat := range rawStats {
+		name, err := nameForSubprogram(subprograms, abstractOrigin)
 		if err != nil {
-			log.Printf("error: couldn't extract name for %v: %v", entry, err)
+			log.Printf("error: couldn't extract name for %d: %v", abstractOrigin, err)
 		}
 
-		bytes, err := bytesForEntry(rangeSizes, entry)
-
-		info, ok := results[name]
+		s, ok := results[name]
 		if !ok {
-			info = &inlineStats{}
-			results[name] = info
+			s = &stats{}
+			results[name] = s
 		}
-		info.count++
-		info.bytes += uint64(bytes)
+		s.count += rawStat.count
+		s.bytes += rawStat.bytes
 	}
 	return results, nil
 }
 
 type resultSorter struct {
-	// TOOO(dcheng): Bad names are bad.
-	keys    []string
-	results map[string]*inlineStats
+	names   []string
+	results map[string]*stats
 }
 
 func (s *resultSorter) Len() int {
-	return len(s.keys)
+	return len(s.names)
 }
 
 func (s *resultSorter) Swap(i, j int) {
-	s.keys[i], s.keys[j] = s.keys[j], s.keys[i]
+	s.names[i], s.names[j] = s.names[j], s.names[i]
 }
 
 func (s *resultSorter) Less(i, j int) bool {
-	return s.results[s.keys[i]].bytes > s.results[s.keys[j]].bytes
+	return s.results[s.names[i]].bytes > s.results[s.names[j]].bytes
 }
 
-func sortAndPrintTop100(results map[string]*inlineStats) {
-	keys := make([]string, 0, len(results))
-	for k := range results {
-		keys = append(keys, k)
+func sortAndPrintTop100(results map[string]*stats) {
+	names := make([]string, 0, len(results))
+	for n := range results {
+		names = append(names, n)
 	}
-	sort.Sort(&resultSorter{keys, results})
+	sort.Sort(&resultSorter{names, results})
 	fmt.Printf("     Count      Bytes   Name\n")
 	fmt.Printf("  --------  ---------   ---------------------------------\n")
-	for i, k := range keys {
+	for i, n := range names {
 		if i > 100 {
 			break
 		}
-		fmt.Printf("%10d %10d   %s\n", results[k].count, results[k].bytes, k)
+		fmt.Printf("%10d %10d   %s\n", results[n].count, results[n].bytes, n)
 	}
 }
 
