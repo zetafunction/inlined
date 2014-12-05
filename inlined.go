@@ -3,14 +3,90 @@ package main
 import (
 	"debug/dwarf"
 	"debug/elf"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"sort"
 )
 
 const attrMIPSLinkageName dwarf.Attr = 0x2007
+
+type rangeSizeMap map[dwarf.Offset]uint64
+
+// Go's debug/dwarf package doesn't include .debug_ranges parsing support.
+func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
+	log.Print("parsing .debug_ranges...")
+	sectionReader := file.Section(".debug_ranges").Open()
+
+	var byteOrder binary.ByteOrder
+	switch file.Data {
+	case elf.ELFDATA2LSB:
+		byteOrder = binary.LittleEndian
+	case elf.ELFDATA2MSB:
+		byteOrder = binary.BigEndian
+	default:
+		return nil, fmt.Errorf("%v has an unknown byte order", file)
+	}
+
+	var bytesPerAddress uint8
+	switch file.Class {
+	case elf.ELFCLASS32:
+		bytesPerAddress = 4
+	case elf.ELFCLASS64:
+		bytesPerAddress = 8
+	default:
+		return nil, fmt.Errorf("%v has unknown class value", file)
+	}
+
+	// The .debug_ranges format is pretty simple. A DIE may use DW_AT_ranges to refer to a
+	// range in the .debug_ranges section, which represents a range of non-contiguous
+	// addresses. Each entry in the range is a either a range list entry, a base address
+	// selection entry, or an end of list entry.
+	// - A range list entry consists of a beginning address offset and an ending address
+	//   offset. The beginning address offset may be 0x0, and the length of the range may be
+	//   0, if the beginning and ending address offsets are equal. Range list entries may
+	//   not overlap.
+	// - A base address selection entry, which consists of the largest representable
+	//   address, e.g. 0xffffffff for 32-bit addresses, and an address that defines the base
+	//   address of subsequent entries.
+	// - An end of list entry is a range list entry that has a beginning and ending address
+	//   offset of 0.
+	var currentOffset, pendingOffset dwarf.Offset
+	rangeSizes := make(rangeSizeMap)
+	buffer := make([]byte, 2*bytesPerAddress)
+	for {
+		n, err := sectionReader.Read(buffer)
+		if n == 0 && err == io.EOF {
+			return rangeSizes, nil
+		} else if n != len(buffer) {
+			return nil, fmt.Errorf("read strange number of bytes: %d", n)
+		} else if err != nil {
+			return nil, err
+		}
+		pendingOffset += dwarf.Offset(n)
+		var begin, end uint64
+		switch file.Class {
+		case elf.ELFCLASS32:
+			begin = uint64(byteOrder.Uint32(buffer))
+			end = uint64(byteOrder.Uint64(buffer[4:]))
+		case elf.ELFCLASS64:
+			begin = byteOrder.Uint64(buffer)
+			end = byteOrder.Uint64(buffer[8:])
+		}
+		if begin == 0 && end == 0 {
+			currentOffset = pendingOffset
+			continue
+		}
+		bytes := end - begin
+		if bytes < 0 {
+			return nil, fmt.Errorf("got invalid range %v", buffer)
+		}
+		rangeSizes[currentOffset] += bytes
+	}
+}
 
 type subprogramMap map[dwarf.Offset]*dwarf.Entry
 
@@ -27,13 +103,13 @@ func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error
 		return name, nil
 	}
 
-	// Some DIEs chain to another DIE with the specification attribute.
+	// Some DIEs chain to another DIE with DW_AT_specification.
 	// TODO(dcheng): Document when this happens.
 	if specOffset, ok := subprogram.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
 		return nameForEntry(subprograms, specOffset)
 	}
 
-	// Otherwise, fall back to the name attribute. This is probably a plain C function.
+	// Otherwise, fall back to DW_AT_name. This is probably a plain C function.
 	if name, ok := subprogram.Val(dwarf.AttrName).(string); ok {
 		return name, nil
 	}
@@ -41,28 +117,62 @@ func nameForEntry(subprograms subprogramMap, offset dwarf.Offset) (string, error
 	return "", fmt.Errorf("%v missing name, linkage name, and spec", subprogram)
 }
 
+func bytesForEntry(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) {
+	// Per the DWARF spec, a DIE with associated machine code may have:
+	// - A DW_AT_low_pc attribute for a snigle address (not handled)
+	// - A DW_AT_low_pc and DW_AT_high_pc attribute for a single contiguous range of
+	//   addresses, or
+	// - A DW_AT_ranges attribute for a non-contiguous range of addresses.
+
+	// The spec notes that DW_AT_high_pc may be either of class address or class constant.
+	// In the latter case, DW_AT_high_pc is an offset from DW_AT_low_pc which gives the
+	// first instruction past the last instruction associated with the DIE. This code
+	// assumes the latter, since that's what Clang emits and it makes the code simpler.
+	if bytes, ok := entry.Val(dwarf.AttrHighpc).(int64); ok {
+		if bytes < 0 {
+			return 0, fmt.Errorf("%v has negative size %d", entry, bytes)
+		}
+		return uint64(bytes), nil
+	}
+
+	rangeOffset, ok := entry.Val(dwarf.AttrRanges).(dwarf.Offset)
+	if !ok {
+		return 0, fmt.Errorf("%v has no valid high pc or range", entry)
+	}
+	bytes, ok := rangeSizes[rangeOffset]
+	if !ok {
+		return 0, fmt.Errorf("couldn't find range entry for %v", entry)
+	}
+	return bytes, nil
+}
+
 type inlineStats struct {
 	count uint64 // Number of times the function was inlined.
 	bytes uint64 // Total bytes inlined for the function.
 }
 
-func analyze(elf *elf.File) (map[string]*inlineStats, error) {
+func analyze(file *elf.File) (map[string]*inlineStats, error) {
+	rangeSizes, err := parseDebugRangesFromELF(file)
+	if err != nil {
+		return nil, err
+	}
+
 	// Strictly speaking, dwarf.Data should have other debug sections too, but in practice,
 	// only .debug_info is exposed.
-	debugInfo, err := elf.DWARF()
+	debugInfo, err := file.DWARF()
 	if err != nil {
 		return nil, err
 	}
 
 	// DIEs may refer to a DIE with a greater offset, so collect all interesting DIEs first.
-	reader := debugInfo.Reader()
+	infoReader := debugInfo.Reader()
 	subprograms := make(subprogramMap)
 	inlinedSubroutines := make([]*dwarf.Entry, 0, 1024)
 	for i := 0; ; i++ {
-		if i % 1000000 == 0 {
+		if i%1000000 == 0 {
 			log.Printf("read %d DIEs...", i)
 		}
-		entry, err := reader.Next()
+		entry, err := infoReader.Next()
 		if err != nil {
 			return nil, err
 		}
@@ -71,6 +181,8 @@ func analyze(elf *elf.File) (map[string]*inlineStats, error) {
 		}
 		switch entry.Tag {
 		case dwarf.TagSubprogram:
+			// TODO(dcheng): Consider storing a reduced set of information, since
+			// there are a lot of subprogram DIEs in Chrome.
 			subprograms[entry.Offset] = entry
 		case dwarf.TagInlinedSubroutine:
 			inlinedSubroutines = append(inlinedSubroutines, entry)
@@ -90,17 +202,7 @@ func analyze(elf *elf.File) (map[string]*inlineStats, error) {
 			log.Printf("error: couldn't extract name for %v: %v", entry, err)
 		}
 
-		// Despite the name, this is relative to Lowpc, so it's actually a byte count.
-		bytes, ok := entry.Val(dwarf.AttrHighpc).(int64)
-		if !ok {
-			// TODO(dcheng): Handle AttrRanges.
-			continue
-			log.Printf("error: couldn't extract AttrHighpc for %v", entry)
-		}
-		if bytes < 0 {
-			log.Printf("error: %v has a negative AttrHighpc", entry)
-			continue
-		}
+		bytes, err := bytesForEntry(rangeSizes, entry)
 
 		info, ok := results[name]
 		if !ok {
@@ -150,12 +252,12 @@ func sortAndPrintTop100(results map[string]*inlineStats) {
 func main() {
 	for _, f := range os.Args[1:] {
 		log.Printf("analyzing %s...", f)
-		elf, err := elf.Open(f)
+		file, err := elf.Open(f)
 		if err != nil {
 			log.Printf("error: couldn't open %s: %v", f, err)
 			continue
 		}
-		results, err := analyze(elf)
+		results, err := analyze(file)
 		if err != nil {
 			log.Printf("error: couldn't analyze debug data for %s: %v", f, err)
 			continue
