@@ -20,7 +20,10 @@ type rangeSizeMap map[int64]uint64
 // Go's debug/dwarf package doesn't include .debug_ranges parsing support.
 func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 	log.Print("parsing .debug_ranges...")
-	sectionReader := file.Section(".debug_ranges").Open()
+	section := file.Section(".debug_ranges")
+	if section == nil {
+		return nil, nil
+	}
 
 	var byteOrder binary.ByteOrder
 	switch file.Data {
@@ -58,8 +61,8 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 	var currentOffset, pendingOffset int64
 	rangeSizes := make(rangeSizeMap)
 	buffer := make([]byte, 2*bytesPerAddress)
-	for {
-		n, err := sectionReader.Read(buffer)
+	for reader := section.Open(); ; {
+		n, err := reader.Read(buffer)
 		if n == 0 && err == io.EOF {
 			return rangeSizes, nil
 		} else if n != len(buffer) {
@@ -148,6 +151,7 @@ func bytesForInlinedSubroutine(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uin
 	//   addresses, or
 	// - A DW_AT_ranges attribute for a non-contiguous range of addresses.
 
+	// TODO(dcheng): This tool should be able to handle either form.
 	// The spec notes that DW_AT_high_pc may be either of class address or class constant.
 	// In the latter case, DW_AT_high_pc is an offset from DW_AT_low_pc which gives the
 	// first instruction past the last instruction associated with the DIE. This code
