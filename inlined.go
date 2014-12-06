@@ -4,7 +4,6 @@ import (
 	"debug/dwarf"
 	"debug/elf"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -98,50 +97,19 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 	}
 }
 
-type subprogramEntry struct {
-	name          string
-	linkageName   string
-	hasSpecOffset bool
-	specOffset    dwarf.Offset
-}
-type subprogramMap map[dwarf.Offset]*subprogramEntry
-
-func newSubprogramEntry(entry *dwarf.Entry) *subprogramEntry {
-	subprogram := &subprogramEntry{}
-	if linkageName, ok := entry.Val(attrMIPSLinkageName).(string); ok {
-		subprogram.linkageName = linkageName
-	}
-	if specOffset, ok := entry.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
-		subprogram.hasSpecOffset = true
-		subprogram.specOffset = specOffset
-	}
-	if name, ok := entry.Val(dwarf.AttrName).(string); ok {
-		subprogram.name = name
-	}
-	return subprogram
-}
+type nameMap map[dwarf.Offset]string
+type specMap map[dwarf.Offset]dwarf.Offset
 
 // Attempts to extract a function name from the DIE at the provided offset. Unfortunately, since
 // it's C++ and DWARF, it's not just a simple matter of getting name attribute and returning it.
-func nameForSubprogram(subprograms subprogramMap, offset dwarf.Offset) (string, error) {
-	subprogram, ok := subprograms[offset]
-	if !ok {
-		return "", errors.New("couldn't find subprogram")
+func nameForSubprogram(names nameMap, specs specMap, offset dwarf.Offset) (string, error) {
+	if specOffset, ok := specs[offset]; ok {
+		return nameForSubprogram(names, specs, specOffset)
 	}
-
-	if subprogram.linkageName != "" {
-		return subprogram.linkageName, nil
+	if name, ok := names[offset]; ok {
+		return name, nil
 	}
-
-	if subprogram.hasSpecOffset {
-		return nameForSubprogram(subprograms, subprogram.specOffset)
-	}
-
-	if subprogram.name != "" {
-		return subprogram.name, nil
-	}
-
-	return "", fmt.Errorf("subprogram 0x%x has no name, linkage name, or spec", offset)
+	return "", fmt.Errorf("could not find name or spec for subprogram 0x%x", offset)
 }
 
 func bytesForInlinedSubroutine(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) {
@@ -195,7 +163,8 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 	// DIEs may refer to a DIE with a greater offset, so defer name resolution until all DIEs
 	// have been read.
 	infoReader := debugInfo.Reader()
-	subprograms := make(subprogramMap)
+	names := make(nameMap)
+	specs := make(specMap)
 	rawStats := make(map[dwarf.Offset]*stats)
 	for i := 0; ; i++ {
 		if i%1000000 == 0 {
@@ -210,7 +179,18 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 		}
 		switch entry.Tag {
 		case dwarf.TagSubprogram:
-			subprograms[entry.Offset] = newSubprogramEntry(entry)
+			if linkageName, ok := entry.Val(attrMIPSLinkageName).(string); ok {
+				names[entry.Offset] = linkageName
+				continue
+			}
+			if specOffset, ok := entry.Val(dwarf.AttrSpecification).(dwarf.Offset); ok {
+				specs[entry.Offset] = specOffset
+				continue
+			}
+			if name, ok := entry.Val(dwarf.AttrName).(string); ok {
+				names[entry.Offset] = name
+				continue
+			}
 		case dwarf.TagInlinedSubroutine:
 			abstractOrigin, ok := entry.Val(dwarf.AttrAbstractOrigin).(dwarf.Offset)
 			if !ok {
@@ -235,7 +215,7 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 	log.Printf("resolving names for %d inlined functions", len(rawStats))
 	results := make(map[string]*stats)
 	for abstractOrigin, rawStat := range rawStats {
-		name, err := nameForSubprogram(subprograms, abstractOrigin)
+		name, err := nameForSubprogram(names, specs, abstractOrigin)
 		if err != nil {
 			log.Printf("error: couldn't extract name for %d: %v", abstractOrigin, err)
 		}
