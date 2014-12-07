@@ -4,13 +4,16 @@ import (
 	"debug/dwarf"
 	"debug/elf"
 	"encoding/binary"
+	"flag"
 	"fmt"
 	"io"
 	"log"
 	"math"
-	"os"
 	"sort"
 )
+
+var formatFlag = flag.String("format", "text", "Output format. Valid values are 'json' or 'text'.")
+var limitFlag = flag.Uint64("limit", 100, "Limit output to top n entries. 0 = no limit.")
 
 const attrMIPSLinkageName dwarf.Attr = 0x2007
 
@@ -143,8 +146,8 @@ func bytesForInlinedSubroutine(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uin
 }
 
 type stats struct {
-	count uint64 // Number of times the function was inlined.
-	bytes uint64 // Total bytes inlined for the function.
+	Count uint64 // Number of times the function was inlined.
+	Bytes uint64 // Total bytes inlined for the function.
 }
 
 func analyze(file *elf.File) (map[string]*stats, error) {
@@ -207,8 +210,8 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 				s = &stats{}
 				rawStats[abstractOrigin] = s
 			}
-			s.count++
-			s.bytes += bytes
+			s.Count++
+			s.Bytes += bytes
 		}
 	}
 
@@ -225,8 +228,8 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 			s = &stats{}
 			results[name] = s
 		}
-		s.count += rawStat.count
-		s.bytes += rawStat.bytes
+		s.Count += rawStat.Count
+		s.Bytes += rawStat.Bytes
 	}
 	return results, nil
 }
@@ -245,27 +248,39 @@ func (s *resultSorter) Swap(i, j int) {
 }
 
 func (s *resultSorter) Less(i, j int) bool {
-	return s.results[s.names[i]].bytes > s.results[s.names[j]].bytes
+	return s.results[s.names[i]].Bytes > s.results[s.names[j]].Bytes
 }
 
-func sortAndPrintTop100(results map[string]*stats) {
+func printSortedResults(results map[string]*stats, format string, limit uint64) {
+	if limit == 0 {
+		limit = uint64(len(results))
+	}
 	names := make([]string, 0, len(results))
 	for n := range results {
 		names = append(names, n)
 	}
 	sort.Sort(&resultSorter{names, results})
-	fmt.Printf("     Count      Bytes   Name\n")
-	fmt.Printf("  --------  ---------   ---------------------------------\n")
-	for i, n := range names {
-		if i > 100 {
-			break
+	switch format {
+	case "text":
+		fmt.Printf("     Count      Bytes   Name\n")
+		fmt.Printf("  --------  ---------   ---------------------------------\n")
+		for _, n := range names[:limit] {
+			fmt.Printf("%10d %10d   %s\n", results[n].Count, results[n].Bytes, n)
 		}
-		fmt.Printf("%10d %10d   %s\n", results[n].count, results[n].bytes, n)
+	case "json":
 	}
 }
 
 func main() {
-	for _, f := range os.Args[1:] {
+	flag.Parse()
+	switch *formatFlag {
+	case "json":
+	case "text":
+	default:
+		log.Fatalf("error: invalid argument for --output: %s", *formatFlag)
+	}
+
+	for _, f := range flag.Args() {
 		log.Printf("analyzing %s...", f)
 		file, err := elf.Open(f)
 		if err != nil {
@@ -277,6 +292,6 @@ func main() {
 			log.Printf("error: couldn't analyze debug data for %s: %v", f, err)
 			continue
 		}
-		sortAndPrintTop100(results)
+		printSortedResults(results, *formatFlag, *limitFlag)
 	}
 }
