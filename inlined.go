@@ -287,6 +287,7 @@ func main() {
 			log.Printf("error: couldn't open %s: %v", f, err)
 			continue
 		}
+		defer file.Close()
 		results, err := analyze(file)
 		if err != nil {
 			log.Printf("error: couldn't analyze debug data for %s: %v", f, err)
