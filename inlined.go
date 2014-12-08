@@ -13,8 +13,9 @@ import (
 	"sort"
 )
 
-var formatFlag = flag.String("format", "text", "Output format. Valid values are 'json' or 'text'.")
-var limitFlag = flag.Uint64("limit", 100, "Limit output to top n entries. 0 = no limit.")
+var formatFlag = flag.String("format", "text", "Output format. Valid options are 'json' or 'text'.")
+var limitFlag = flag.Uint64("limit", 100, "Number of entries to show. 0 = no limit.")
+var sortFlag = flag.String("sort", "total-bytes", "Sorting order. Valid options are 'count', 'instance-bytes', or 'total-bytes'.")
 
 const attrMIPSLinkageName dwarf.Attr = 0x2007
 
@@ -247,22 +248,50 @@ func analyze(file *elf.File) ([]*result, error) {
 	return results, nil
 }
 
-type byBytes []*result
-
-func (b byBytes) Len() int {
-	return len(b)
+type by func(r1, r2 *result) bool
+type resultSorter struct {
+	results []*result
+	by by
 }
 
-func (b byBytes) Swap(i, j int) {
-	b[i], b[j] = b[j], b[i]
+func (by by) Sort(results []*result) {
+	rs := &resultSorter{
+		results: results,
+		by: by,
+	}
+	sort.Sort(rs)
 }
 
-func (b byBytes) Less(i, j int) bool {
-	return b[i].Bytes > b[j].Bytes
+func (s *resultSorter) Len() int {
+	return len(s.results)
 }
 
-func printSortedResults(results []*result, format string, limit uint64) {
-	sort.Sort(byBytes(results))
+func (s *resultSorter) Swap(i, j int) {
+	s.results[i], s.results[j] = s.results[j], s.results[i]
+}
+
+func (s *resultSorter) Less(i, j int) bool {
+	return s.by(s.results[i], s.results[j])
+}
+
+func printSortedResults(results []*result, ordering string, format string, limit uint64) {
+	var by by
+	switch ordering {
+	case "count":
+		by = func (r1, r2 *result) bool {
+			return r1.Count > r2.Count
+		}
+	case "instance-bytes":
+		by = func (r1, r2 *result) bool {
+			return r1.Bytes / r1.Count > r2.Bytes / r2.Count
+		}
+	case "total-bytes":
+		by = func (r1, r2 *result) bool {
+			return r1.Bytes > r2.Bytes
+		}
+	}
+	by.Sort(results)
+
 	if limit == 0 {
 		limit = uint64(len(results))
 	}
@@ -290,7 +319,14 @@ func main() {
 	case "json":
 	case "text":
 	default:
-		log.Fatalf("error: invalid argument for --output: %s", *formatFlag)
+		log.Fatalf("error: invalid option for --format: %s", *formatFlag)
+	}
+	switch *sortFlag {
+	case "count":
+	case "instance-bytes":
+	case "total-bytes":
+	default:
+		log.Fatalf("error: invalid option for --sort: %s", *sortFlag)
 	}
 
 	for _, f := range flag.Args() {
@@ -306,6 +342,6 @@ func main() {
 			log.Printf("error: couldn't analyze debug data for %s: %v", f, err)
 			continue
 		}
-		printSortedResults(results, *formatFlag, *limitFlag)
+		printSortedResults(results, *sortFlag, *formatFlag, *limitFlag)
 	}
 }
