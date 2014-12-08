@@ -4,6 +4,7 @@ import (
 	"debug/dwarf"
 	"debug/elf"
 	"encoding/binary"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -149,8 +150,12 @@ type stats struct {
 	Count uint64 // Number of times the function was inlined.
 	Bytes uint64 // Total bytes inlined for the function.
 }
+type result struct {
+	Name string
+	stats
+}
 
-func analyze(file *elf.File) (map[string]*stats, error) {
+func analyze(file *elf.File) ([]*result, error) {
 	rangeSizes, err := parseDebugRangesFromELF(file)
 	if err != nil {
 		return nil, err
@@ -168,7 +173,7 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 	infoReader := debugInfo.Reader()
 	names := make(nameMap)
 	specs := make(specMap)
-	rawStats := make(map[dwarf.Offset]*stats)
+	abstractOriginStats := make(map[dwarf.Offset]*stats)
 	for i := 0; ; i++ {
 		if i%1000000 == 0 {
 			log.Printf("read %d DIEs...", i)
@@ -205,69 +210,77 @@ func analyze(file *elf.File) (map[string]*stats, error) {
 				log.Printf("error: %v", err)
 				continue
 			}
-			s, ok := rawStats[abstractOrigin]
+			s, ok := abstractOriginStats[abstractOrigin]
 			if !ok {
 				s = &stats{}
-				rawStats[abstractOrigin] = s
+				abstractOriginStats[abstractOrigin] = s
 			}
 			s.Count++
 			s.Bytes += bytes
 		}
 	}
 
-	log.Printf("resolving names for %d inlined functions", len(rawStats))
-	results := make(map[string]*stats)
-	for abstractOrigin, rawStat := range rawStats {
+	log.Printf("resolving names for %d inlined functions", len(abstractOriginStats))
+	nameStats := make(map[string]*stats)
+	for abstractOrigin, s := range abstractOriginStats {
 		name, err := nameForSubprogram(names, specs, abstractOrigin)
 		if err != nil {
 			log.Printf("error: couldn't extract name for %d: %v", abstractOrigin, err)
 		}
 
-		s, ok := results[name]
+		ns, ok := nameStats[name]
 		if !ok {
-			s = &stats{}
-			results[name] = s
+			ns = &stats{}
+			nameStats[name] = ns
 		}
-		s.Count += rawStat.Count
-		s.Bytes += rawStat.Bytes
+		ns.Count += s.Count
+		ns.Bytes += s.Bytes
+	}
+
+	results := make([]*result, 0, len(nameStats))
+	for k, v := range nameStats {
+		results = append(results, &result{
+			Name: k,
+			stats: *v,
+		})
 	}
 	return results, nil
 }
 
-type resultSorter struct {
-	names   []string
-	results map[string]*stats
+type byBytes []*result
+
+func (b byBytes) Len() int {
+	return len(b)
 }
 
-func (s *resultSorter) Len() int {
-	return len(s.names)
+func (b byBytes) Swap(i, j int) {
+	b[i], b[j] = b[j], b[i]
 }
 
-func (s *resultSorter) Swap(i, j int) {
-	s.names[i], s.names[j] = s.names[j], s.names[i]
+func (b byBytes) Less(i, j int) bool {
+	return b[i].Bytes > b[j].Bytes
 }
 
-func (s *resultSorter) Less(i, j int) bool {
-	return s.results[s.names[i]].Bytes > s.results[s.names[j]].Bytes
-}
-
-func printSortedResults(results map[string]*stats, format string, limit uint64) {
+func printSortedResults(results []*result, format string, limit uint64) {
+	sort.Sort(byBytes(results))
 	if limit == 0 {
 		limit = uint64(len(results))
 	}
-	names := make([]string, 0, len(results))
-	for n := range results {
-		names = append(names, n)
-	}
-	sort.Sort(&resultSorter{names, results})
+	results = results[:limit]
 	switch format {
 	case "text":
 		fmt.Printf("     Count      Bytes   Name\n")
 		fmt.Printf("  --------  ---------   ---------------------------------\n")
-		for _, n := range names[:limit] {
-			fmt.Printf("%10d %10d   %s\n", results[n].Count, results[n].Bytes, n)
+		for _, r := range results {
+			fmt.Printf("%10d %10d   %s\n", r.Count, r.Bytes, r.Name)
 		}
 	case "json":
+		b, err := json.Marshal(results)
+		if err != nil {
+			log.Printf("error: JSON result serialization failed: %v", err)
+			return
+		}
+		fmt.Printf("%s\n", b)
 	}
 }
 
