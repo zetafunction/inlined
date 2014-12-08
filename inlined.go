@@ -60,7 +60,7 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 	//   address of subsequent entries.
 	// - An end of list entry is a range list entry that has a beginning and ending address
 	//   offset of 0.
-	var currentOffset, pendingOffset int64
+	var currentOffset, nextOffset int64
 	rangeSizes := make(rangeSizeMap)
 	buffer := make([]byte, 2*bytesPerAddress)
 	for reader := section.Open(); ; {
@@ -72,7 +72,7 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 		} else if err != nil {
 			return nil, err
 		}
-		pendingOffset += int64(n)
+		nextOffset += int64(n)
 		var begin, end uint64
 		switch file.Class {
 		case elf.ELFCLASS32:
@@ -89,7 +89,7 @@ func parseDebugRangesFromELF(file *elf.File) (rangeSizeMap, error) {
 			}
 		}
 		if begin == 0 && end == 0 {
-			currentOffset = pendingOffset
+			currentOffset = nextOffset
 			continue
 		}
 		bytes := end - begin
