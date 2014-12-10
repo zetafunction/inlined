@@ -292,7 +292,7 @@ func printSortedResults(results []*result, ordering string, format string, limit
 	}
 	by.Sort(results)
 
-	if limit == 0 {
+	if limit == 0 || limit > uint64(len(results)) {
 		limit = uint64(len(results))
 	}
 	results = results[:limit]
