@@ -17,7 +17,7 @@ var formatFlag = flag.String("format", "text", "Output format. Valid options are
 var limitFlag = flag.Uint64("limit", 100, "Number of entries to show. 0 = no limit.")
 var sortFlag = flag.String("sort", "total-bytes", "Sorting order. Valid options are 'count', 'instance-bytes', or 'total-bytes'.")
 
-const attrMIPSLinkageName dwarf.Attr = 0x2007
+const attrLinkageName dwarf.Attr = 0x6e
 
 type rangeSizeMap map[int64]uint64
 
@@ -188,7 +188,7 @@ func analyze(file *elf.File) ([]*result, error) {
 		}
 		switch entry.Tag {
 		case dwarf.TagSubprogram:
-			if linkageName, ok := entry.Val(attrMIPSLinkageName).(string); ok {
+			if linkageName, ok := entry.Val(attrLinkageName).(string); ok {
 				names[entry.Offset] = linkageName
 				continue
 			}
