@@ -106,7 +106,7 @@ type nameMap map[dwarf.Offset]string
 type specMap map[dwarf.Offset]dwarf.Offset
 
 // Attempts to extract a function name from the DIE at the provided offset. Unfortunately, since
-// it's C++ and DWARF, it's not just a simple matter of getting name attribute and returning it.
+// it's C++ and DWARF, it's not just a matter of getting the name attribute and returning it.
 func nameForSubprogram(names nameMap, specs specMap, offset dwarf.Offset) (string, error) {
 	if specOffset, ok := specs[offset]; ok {
 		return nameForSubprogram(names, specs, specOffset)
@@ -119,7 +119,7 @@ func nameForSubprogram(names nameMap, specs specMap, offset dwarf.Offset) (strin
 
 func bytesForInlinedSubroutine(rangeSizes rangeSizeMap, entry *dwarf.Entry) (uint64, error) {
 	// Per the DWARF spec, a DIE with associated machine code may have:
-	// - A DW_AT_low_pc attribute for a snigle address (not handled)
+	// - A DW_AT_low_pc attribute for a single address (not handled)
 	// - A DW_AT_low_pc and DW_AT_high_pc attribute for a single contiguous range of
 	//   addresses, or
 	// - A DW_AT_ranges attribute for a non-contiguous range of addresses.
